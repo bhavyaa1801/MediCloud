@@ -1,0 +1,221 @@
+rules_version = '2';
+// FREE-PLAN (Spark) design: no Cloud Functions, so the browser writes directly and THESE RULES are the backend.
+// Roles live in users/{uid}.role (clients cannot change it). Deactivated users are blocked immediately (active()).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function active() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'active';
+    }
+    function role() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role; }
+    function profile() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.profileId; }
+    function isRole(r) { return active() && role() == r; }
+    function isAdmin() { return isRole('admin'); }
+    function isReception() { return isRole('receptionist'); }
+    function isStaff() { return isAdmin() || isReception(); }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function colFor(r) { return r == 'doctor' ? 'doctors' : (r == 'receptionist' ? 'staff' : 'patients'); }
+    function validTransition(from, to) {
+      return (from == 'pending' && (to == 'confirmed' || to == 'cancelled' || to == 'completed'))
+          || (from == 'confirmed' && (to == 'completed' || to == 'cancelled' || to == 'no_show'));
+    }
+    function cancelWindowHours() {
+      return exists(/databases/$(database)/documents/settings/hospital)
+        ? get(/databases/$(database)/documents/settings/hospital).data.cancelWindowHours : 2;
+    }
+
+    // ---------- users ----------
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid','name','email','phone','role','profileId','profileImage','status','createdAt','updatedAt'])
+        && request.resource.data.uid == uid
+        && request.resource.data.status == 'active'
+        && request.resource.data.name is string && request.resource.data.name.size() >= 3
+        && (
+          // self-registration: ALWAYS a patient; the patient profile must be created in the same batch
+          (request.auth.uid == uid && request.resource.data.role == 'patient'
+            && request.resource.data.email == request.auth.token.email
+            && getAfter(/databases/$(database)/documents/patients/$(request.resource.data.profileId)).data.uid == uid)
+          // admin provisions doctor / receptionist / patient accounts
+          || (isAdmin() && request.auth.uid != uid && request.resource.data.role in ['doctor','receptionist','patient']
+            && getAfter(/databases/$(database)/documents/$(colFor(request.resource.data.role))/$(request.resource.data.profileId)).data.uid == uid)
+          // receptionist registers patients
+          || (isReception() && request.auth.uid != uid && request.resource.data.role == 'patient'
+            && getAfter(/databases/$(database)/documents/patients/$(request.resource.data.profileId)).data.uid == uid)
+        );
+      allow update: if signedIn() && (
+        (request.auth.uid == uid && changed().hasOnly(['name','phone','profileImage','updatedAt']))
+        || (isAdmin() && request.auth.uid != uid && changed().hasOnly(['role','status','name','phone','updatedAt'])
+            && (request.resource.data.role == resource.data.role
+                || (request.resource.data.role in ['patient','admin'] && resource.data.role in ['patient','admin'])))
+        || (isReception() && resource.data.role == 'patient' && changed().hasOnly(['name','phone','updatedAt']))
+      );
+      allow delete: if false;
+    }
+
+    // ---------- profiles ----------
+    match /patients/{id} {
+      allow read: if isStaff()
+        || (isRole('patient') && resource.data.uid == request.auth.uid)
+        || (isRole('doctor') && exists(/databases/$(database)/documents/patients/$(id)/careTeam/$(profile())));
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid','patientId','name','email','phone','dateOfBirth','gender','bloodGroup','address','emergencyContact','status','createdAt','updatedAt'])
+        && request.resource.data.patientId == id && request.resource.data.status == 'active'
+        && (
+          (request.auth.uid == request.resource.data.uid
+            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.profileId == id
+            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'patient')
+          || (isStaff() && request.auth.uid != request.resource.data.uid)
+        );
+      allow update: if
+        ((isRole('patient') && resource.data.uid == request.auth.uid) || isReception())
+          && changed().hasOnly(['name','phone','dateOfBirth','gender','bloodGroup','address','emergencyContact','updatedAt'])
+        || (isAdmin() && changed().hasOnly(['name','phone','dateOfBirth','gender','bloodGroup','address','emergencyContact','status','updatedAt']));
+      allow delete: if false;
+
+      // Doctor<->patient relationship, created when an appointment is booked (never readable by clients).
+      match /careTeam/{doctorId} {
+        allow read: if isStaff()
+             || (isRole('patient')
+        && get(/databases/$(database)/documents/patients/$(id)).data.uid == request.auth.uid);
+        allow create: if signedIn() && (isRole('patient') || isReception())
+          && getAfter(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.doctorId == doctorId
+          && getAfter(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.patientId == id;
+        allow update, delete: if false;
+      }
+    }
+    match /doctors/{id} {
+      allow read: if active();
+      allow create: if isAdmin() && request.resource.data.doctorId == id;
+      allow update: if isAdmin()
+        || (isRole('doctor') && resource.data.uid == request.auth.uid
+            && changed().hasOnly(['name','phone','specialization','qualifications','experience','consultationFee','bio','workingHours','availability','updatedAt']));
+      allow delete: if false;
+    }
+    match /staff/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow create: if isAdmin() && request.resource.data.staffId == id;
+      allow update: if isAdmin() || (isRole('receptionist') && resource.data.uid == request.auth.uid && changed().hasOnly(['name','phone','updatedAt']));
+      allow delete: if false;
+    }
+    match /departments/{id} {
+      allow read: if active();
+      allow create, update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // ---------- appointments ----------
+    match /appointments/{id} {
+      allow read: if isStaff()
+        || (isRole('patient') && resource.data.patientId == profile())
+        || (isRole('doctor') && resource.data.doctorId == profile());
+      // Must be created together with its slot document (see appointmentSlots) in one transaction/batch.
+      allow create: if (isReception() || (isRole('patient') && request.resource.data.patientId == profile()))
+        && request.resource.data.keys().hasOnly(['appointmentId','patientId','doctorId','departmentId','patientUid','doctorUid','patientName','doctorName','departmentName','specialization','date','startTime','endTime','startAt','reason','roomId','fee','status','createdAt','updatedAt'])
+        && request.resource.data.appointmentId == id && request.resource.data.status == 'pending'
+        && request.resource.data.startAt is timestamp && request.resource.data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/appointmentSlots/$(request.resource.data.doctorId + '_' + request.resource.data.date + '_' + request.resource.data.startTime.replace(':',''))).data.appointmentId == id;
+      allow update:
+        if (isRole('patient') && resource.data.patientId == profile()
+              && changed().hasOnly(['status','updatedAt','cancelledBy'])
+              && request.resource.data.status == 'cancelled' && request.resource.data.cancelledBy == 'patient'
+              && validTransition(resource.data.status, 'cancelled')
+              && request.time < resource.data.startAt - duration.value(cancelWindowHours(), 'h'))
+        || (isRole('doctor') && resource.data.doctorId == profile()
+              && changed().hasOnly(['status','consultation','updatedAt','cancelledBy'])
+              && (request.resource.data.status == resource.data.status || validTransition(resource.data.status, request.resource.data.status)))
+        || (isReception() && changed().hasOnly(['status','updatedAt','cancelledBy'])
+              && request.resource.data.status in ['confirmed','cancelled']
+              && validTransition(resource.data.status, request.resource.data.status))
+        || (isAdmin() && changed().hasOnly(['status','updatedAt','cancelledBy'])
+              && validTransition(resource.data.status, request.resource.data.status));
+      allow delete: if false;
+    }
+    // The lock that prevents double booking: deterministic id doctor_date_HHMM, create-only.
+    match /appointmentSlots/{slotId} {
+      allow read: if active();
+      allow create: if (isRole('patient') || isReception())
+        && request.resource.data.status == 'booked'
+        && slotId == request.resource.data.doctorId + '_' + request.resource.data.date + '_' + request.resource.data.startTime.replace(':','')
+        && getAfter(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.doctorId == request.resource.data.doctorId
+        && getAfter(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.date == request.resource.data.date
+        && getAfter(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.startTime == request.resource.data.startTime;
+      allow update: if false;
+      allow delete: if active()
+        && getAfter(/databases/$(database)/documents/appointments/$(resource.data.appointmentId)).data.status == 'cancelled';
+    }
+
+    // ---------- clinical data ----------
+    match /medicalRecords/{id} {
+      allow read: if isAdmin()
+        || (isRole('patient') && resource.data.patientId == profile())
+        || (isRole('doctor') && resource.data.doctorId == profile());
+      allow create: if request.resource.data.uploadedBy == request.auth.uid && (
+        (isRole('doctor') && request.resource.data.doctorId == profile()
+          && exists(/databases/$(database)/documents/patients/$(request.resource.data.patientId)/careTeam/$(profile())))
+        || (isRole('patient') && request.resource.data.patientId == profile() && request.resource.data.doctorId == null));
+      allow update: if false;
+      allow delete: if isAdmin() || (isRole('doctor') && resource.data.doctorId == profile());
+      // File bytes (base64, small files only - Firebase Storage needs a paid plan).
+      match /files/{fileId} {
+        allow read: if isAdmin()
+          || (isRole('patient') && get(/databases/$(database)/documents/medicalRecords/$(id)).data.patientId == profile())
+          || (isRole('doctor') && get(/databases/$(database)/documents/medicalRecords/$(id)).data.doctorId == profile());
+        allow create: if getAfter(/databases/$(database)/documents/medicalRecords/$(id)).data.uploadedBy == request.auth.uid;
+        allow update: if false;
+        allow delete: if isAdmin() || (isRole('doctor') && get(/databases/$(database)/documents/medicalRecords/$(id)).data.doctorId == profile());
+      }
+    }
+    match /prescriptions/{id} {
+      allow read: if isAdmin()
+        || (isRole('patient') && resource.data.patientId == profile())
+        || (isRole('doctor') && resource.data.doctorId == profile());
+      allow create: if isRole('doctor') && request.resource.data.doctorId == profile()
+        && exists(/databases/$(database)/documents/patients/$(request.resource.data.patientId)/careTeam/$(profile()));
+      allow update, delete: if false;
+    }
+
+    // ---------- hospital ----------
+    match /resources/{id} {
+      allow read, create, update: if isAdmin();
+      allow delete: if false;
+    }
+    match /settings/{id} {
+      allow read: if active();
+      allow write: if isAdmin();
+    }
+    match /counters/{name} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.keys().hasOnly(['next']) && request.resource.data.next is int;
+      allow update: if signedIn() && request.resource.data.keys().hasOnly(['next']) && request.resource.data.next == resource.data.next + 1;
+      allow delete: if false;
+    }
+
+    // ---------- notifications & audit ----------
+    match /notifications/{nid} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create: if active()
+        && request.resource.data.keys().hasOnly(['notificationId','userId','title','message','type','isRead','createdAt'])
+        && request.resource.data.notificationId == nid && request.resource.data.isRead == false
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.title.size() <= 120 && request.resource.data.message.size() <= 400;
+      allow update: if signedIn() && resource.data.userId == request.auth.uid && changed().hasOnly(['isRead']);
+      allow delete: if false;
+    }
+    // Append-only, and an actor can only log as themselves (cannot impersonate or edit/delete history).
+    match /auditLogs/{lid} {
+      allow read: if isAdmin();
+      allow create: if active()
+        && request.resource.data.keys().hasOnly(['actorId','actorRole','actorName','action','resourceType','resourceId','status','metadata','timestamp'])
+        && request.resource.data.actorId == request.auth.uid && request.resource.data.actorRole == role()
+        && request.resource.data.timestamp == request.time;
+      allow update, delete: if false;
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}

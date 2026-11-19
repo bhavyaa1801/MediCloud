@@ -1,0 +1,62 @@
+'use strict'
+const { admin, db, FieldValue, E, ok, handler, requireRole, v, auditSet, rateLimit } = require('../lib/common')
+const { provision } = require('../lib/provision')
+
+// Public self-registration. ONLY ever grants the patient role; role is never read from the client.
+exports.completePatientRegistration = handler(async (req) => {
+  if (!req.auth) throw E('UNAUTHENTICATED', 'Please sign in to continue.')
+  const uid = req.auth.uid
+  await rateLimit(uid, 'register', 5, 3600)
+  if ((await db.doc(`users/${uid}`).get()).exists) throw E('ALREADY_REGISTERED', 'This account is already registered.')
+  const rec = await admin.auth().getUser(uid)
+  if (!rec.email) throw E('INVALID_ARGUMENT', 'Account has no email.')
+  const name = v.str(req.data?.name, 'Name', { min: 3, max: 80 })
+  const phone = v.phone(req.data?.phone)
+  const dob = v.date(req.data?.dateOfBirth, 'Date of birth')
+  if (dob > new Date().toISOString().slice(0, 10)) throw E('INVALID_ARGUMENT', 'Date of birth cannot be in the future.')
+  const gender = v.oneOf(req.data?.gender, 'Gender', ['Female', 'Male', 'Other'])
+  const { profileId } = await provision({ role: 'patient', uid, email: rec.email.toLowerCase(), name, phone, profile: { dateOfBirth: dob, gender, bloodGroup: '', address: '', emergencyContact: '' } })
+  await admin.auth().updateUser(uid, { displayName: name })
+  return ok({ profileId, role: 'patient' }, 'Registration complete.')
+})
+
+exports.recordLogin = handler(async (req) => {
+  const actor = await requireRole(req)
+  await rateLimit(actor.uid, 'login-audit', 20, 3600)
+  const b = db.batch(); auditSet(b, actor, 'auth.login', 'users', actor.uid); await b.commit()
+  return ok()
+})
+
+exports.setUserRole = handler(async (req) => {
+  const actor = await requireRole(req, 'admin')
+  const uid = v.str(req.data?.uid, 'uid', { max: 128 })
+  const role = v.oneOf(req.data?.role, 'Role', ['patient', 'admin'])
+  if (uid === actor.uid) throw E('PERMISSION_DENIED', 'You cannot change your own role.')
+  const ref = db.doc(`users/${uid}`); const snap = await ref.get()
+  if (!snap.exists) throw E('NOT_FOUND', 'User not found.')
+  if (snap.data().role === 'doctor') throw E('INVALID_ARGUMENT', 'Doctor accounts are managed from the Doctors page.')
+  const b = db.batch()
+  b.update(ref, { role, updatedAt: FieldValue.serverTimestamp() }); auditSet(b, actor, 'user.role_changed', 'users', uid, { role })
+  await b.commit()
+  await admin.auth().setCustomUserClaims(uid, { role, profileId: snap.data().profileId })
+  await admin.auth().revokeRefreshTokens(uid)
+  return ok({}, 'Role updated.')
+})
+
+exports.setUserStatus = handler(async (req) => {
+  const actor = await requireRole(req, 'admin')
+  const uid = v.str(req.data?.uid, 'uid', { max: 128 })
+  const status = v.oneOf(req.data?.status, 'Status', ['active', 'inactive'])
+  if (uid === actor.uid) throw E('PERMISSION_DENIED', 'You cannot change your own account status.')
+  const ref = db.doc(`users/${uid}`); const snap = await ref.get()
+  if (!snap.exists) throw E('NOT_FOUND', 'User not found.')
+  const u = snap.data(); const b = db.batch(); const ts = FieldValue.serverTimestamp()
+  b.update(ref, { status, updatedAt: ts })
+  if (u.role === 'patient') b.update(db.doc(`patients/${u.profileId}`), { status, updatedAt: ts })
+  if (u.role === 'doctor') b.update(db.doc(`doctors/${u.profileId}`), { status, updatedAt: ts })
+  auditSet(b, actor, 'user.status_changed', 'users', uid, { status })
+  await b.commit()
+  await admin.auth().updateUser(uid, { disabled: status === 'inactive' })
+  if (status === 'inactive') await admin.auth().revokeRefreshTokens(uid)
+  return ok({}, `Account ${status}.`)
+})

@@ -1,0 +1,8 @@
+rules_version = '2';
+// Medical documents are never client-accessible. Upload/download happen in Cloud Functions
+// (uploadMedicalRecord / getMedicalRecordFile), which authorize the caller and validate the file.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}

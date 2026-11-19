@@ -1,0 +1,51 @@
+rules_version = '2';
+// Clients are READ-ONLY. Every write goes through Cloud Functions (Admin SDK bypasses rules).
+// Rules are not filters: client queries must include the same constraints (e.g. where patientId == profileId).
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null && request.auth.token.role != null; }
+    function role() { return request.auth.token.role; }
+    function isAdmin() { return signedIn() && role() == 'admin'; }
+    function profile() { return request.auth.token.profileId; }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow write: if false;
+    }
+    match /patients/{id} {
+      allow read: if signedIn() && (isAdmin()
+        || (role() == 'patient' && profile() == id)
+        || (role() == 'doctor' && exists(/databases/$(database)/documents/patients/$(id)/careTeam/$(profile()))));
+      allow write: if false;
+      match /careTeam/{doctorId} { allow read, write: if false; }
+    }
+    match /doctors/{id}     { allow read: if signedIn(); allow write: if false; }
+    match /departments/{id} { allow read: if signedIn(); allow write: if false; }
+
+    match /appointments/{id} {
+      allow read: if signedIn() && (isAdmin()
+        || (role() == 'patient' && resource.data.patientId == profile())
+        || (role() == 'doctor' && resource.data.doctorId == profile()));
+      allow write: if false;
+    }
+    match /medicalRecords/{id} {
+      allow read: if signedIn() && (isAdmin()
+        || (role() == 'patient' && resource.data.patientId == profile())
+        || (role() == 'doctor' && resource.data.doctorId == profile()));
+      allow write: if false;
+    }
+    match /prescriptions/{id} {
+      allow read: if signedIn() && (isAdmin()
+        || (role() == 'patient' && resource.data.patientId == profile())
+        || (role() == 'doctor' && resource.data.doctorId == profile()));
+      allow write: if false;
+    }
+    match /resources/{id}     { allow read: if isAdmin(); allow write: if false; }
+    match /notifications/{id} { allow read: if signedIn() && resource.data.userId == request.auth.uid; allow write: if false; }
+    match /auditLogs/{id}     { allow read: if isAdmin(); allow write: if false; }
+    match /settings/{id}      { allow read: if isAdmin(); allow write: if false; }
+
+    // appointmentSlots, counters, rateLimits: server-only (no client access).
+    match /{document=**} { allow read, write: if false; }
+  }
+}

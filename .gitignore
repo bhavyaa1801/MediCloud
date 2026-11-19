@@ -1,0 +1,59 @@
+
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Build outputs
+dist/
+build/
+out/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# Service account credentials
+serviceAccountKey.json
+service-account*.json
+*-firebase-adminsdk-*.json
+*service-account*.json
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test and coverage
+coverage/
+.nyc_output/
+
+# Temporary files
+tmp/
+temp/
+.cache/
+*.tmp
+
+# Deployment
+.vercel/
+.netlify/
